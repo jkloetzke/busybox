@@ -64,15 +64,32 @@
 //config:	These devices will request userspace look up the files in
 //config:	/lib/firmware/ and if it exists, send it to the kernel for
 //config:	loading into the hardware.
+//config:
+//config:config FEATURE_MDEV_DAEMON
+//config:	bool "Support daemon mode"
+//config:	default y
+//config:	depends on MDEV
+//config:	help
+//config:	Add support to run mdev as daemon.
+//config:
+//config:	Adds the -s option to run mdev in daemon mode handling hotplug
+//config:	events from the kernel like udev. If the system generates many
+//config:	hotplug events this mode of operation will consume less
+//config:	resources than registering mdev as hotplug helper or using the
+//config:	uevent applet.
 
 //applet:IF_MDEV(APPLET(mdev, BB_DIR_SBIN, BB_SUID_DROP))
 
 //kbuild:lib-$(CONFIG_MDEV) += mdev.o
 
 //usage:#define mdev_trivial_usage
-//usage:       "[-s]"
+//usage:       "[-s" IF_FEATURE_MDEV_DAEMON(" | -d [-f]") "]"
 //usage:#define mdev_full_usage "\n\n"
 //usage:       "mdev -s is to be run during boot to scan /sys and populate /dev.\n"
+//usage:	IF_FEATURE_MDEV_DAEMON(
+//usage:       "mdev -d runs mdev as daemon like udev. With -f it will stay in\n"
+//usage:       "the foreground instead of forking.\n"
+//usage:	)
 //usage:       "\n"
 //usage:       "Bare mdev is a kernel hotplug helper. To activate it:\n"
 //usage:       "	echo /sbin/mdev >/proc/sys/kernel/hotplug\n"
@@ -98,6 +115,7 @@
 #include "libbb.h"
 #include "common_bufsiz.h"
 #include "xregex.h"
+#include <linux/netlink.h>
 
 /* "mdev -s" scans /sys/class/xxx, looking for directories which have dev
  * file (it is of the form "M:m\n"). Example: /sys/class/tty/tty0/dev
@@ -249,8 +267,18 @@
 #endif
 
 
+#define BUFFER_SIZE (2*1024)
+#define MAX_ENV 32
+
+#ifndef SO_RCVBUFFORCE
+#define SO_RCVBUFFORCE 33
+#endif
+enum { RCVBUF = 128 * BUFFER_SIZE };
+
 enum {
 	MDEV_OPT_SCAN       = 1 << 0,
+	MDEV_OPT_DAEMON     = 1 << 1,
+	MDEV_OPT_FOREGROUND = 1 << 2,
 };
 
 static const char keywords[] ALIGN1 = "add\0remove\0"; // "change\0"
@@ -1077,10 +1105,11 @@ static void process_action(char *temp, unsigned my_pid)
 	seq = getenv("SEQNUM");
 	op = index_in_strings(keywords, action);
 
-	open_mdev_log(seq, my_pid);
+	if (my_pid)
+		open_mdev_log(seq, my_pid);
 
 	seq_fd = -1;
-	if (seq) {
+	if (my_pid && seq) {
 		seqnum = atoll(seq);
 		seq_fd = wait_for_seqfile(seqnum);
 	}
@@ -1139,10 +1168,6 @@ int mdev_main(int argc UNUSED_PARAM, char **argv)
 
 	INIT_G();
 
-#if ENABLE_FEATURE_MDEV_CONF
-	G.filename = "/etc/mdev.conf";
-#endif
-
 	/* We can be called as hotplug helper */
 	/* Kernel cannot provide suitable stdio fds for us, do it ourself */
 	bb_sanitize_stdio();
@@ -1152,17 +1177,88 @@ int mdev_main(int argc UNUSED_PARAM, char **argv)
 
 	xchdir("/dev");
 
-	opt = getopt32(argv, "s");
+	opt = getopt32(argv, "s" IF_FEATURE_MDEV_DAEMON("df"));
 
+#if ENABLE_FEATURE_MDEV_CONF
+	G.filename = "/etc/mdev.conf";
+	if (opt & (MDEV_OPT_SCAN|MDEV_OPT_DAEMON)) {
+		/* Same as xrealloc_vector(NULL, 4, 0): */
+		G.rule_vec = xzalloc((1 << 4) * sizeof(*G.rule_vec));
+	}
+#endif
+
+#if ENABLE_FEATURE_MDEV_DAEMON
+	if (opt & MDEV_OPT_DAEMON) {
+		/*
+		 * Daemon mode listening on uevent netlink socket.
+		 */
+		struct sockaddr_nl sa;
+		int fd;
+
+		// Subscribe for UEVENT kernel messages
+		sa.nl_family = AF_NETLINK;
+		sa.nl_pad = 0;
+		sa.nl_pid = getpid();
+		sa.nl_groups = 1 << 0;
+		fd = xsocket(AF_NETLINK, SOCK_DGRAM, NETLINK_KOBJECT_UEVENT);
+		xbind(fd, (struct sockaddr *) &sa, sizeof(sa));
+		close_on_exec_on(fd);
+
+		// Without a sufficiently big RCVBUF, a ton of simultaneous events
+		// can trigger ENOBUFS on read, which is unrecoverable.
+		// Reproducer:
+		//	mdev -d
+		// 	find /sys -name uevent -exec sh -c 'echo add >"{}"' ';'
+		//
+		// SO_RCVBUFFORCE (root only) can go above net.core.rmem_max sysctl
+		setsockopt_SOL_SOCKET_int(fd, SO_RCVBUF,      RCVBUF);
+		setsockopt_SOL_SOCKET_int(fd, SO_RCVBUFFORCE, RCVBUF);
+
+		/*
+		 * Make inital scan after the uevent socket is alive and
+		 * _before_ we fork away.
+		 */
+		initial_scan(temp);
+
+		if (!(opt & MDEV_OPT_FOREGROUND))
+			bb_daemonize_or_rexec(0, argv);
+
+		open_mdev_log(NULL, getpid());
+
+		for (;;) {
+			char netbuf[BUFFER_SIZE];
+			char *env_tmp[MAX_ENV];
+			char *s, *end;
+			ssize_t len;
+			int env_idx = 0;
+
+			len = recv(fd, netbuf, BUFFER_SIZE - 1, 0);
+			if (len < 0) {
+				if (errno == EINTR)
+					continue;
+				bb_perror_msg_and_die("recv");
+			}
+			end = netbuf + len;
+			*end = '\0';
+
+			for (s = netbuf; s < end; s = s+strlen(s)+1) {
+				if (strchr(s, '=') && env_idx < MAX_ENV-1) {
+					env_tmp[env_idx++] = s;
+					putenv(s);
+				}
+			}
+
+			process_action(temp, 0);
+
+			while (env_idx)
+				bb_unsetenv(env_tmp[--env_idx]);
+		}
+	}
+#endif
 	if (opt & MDEV_OPT_SCAN) {
 		/*
 		 * Scan: mdev -s
 		 */
-#if ENABLE_FEATURE_MDEV_CONF
-		/* Same as xrealloc_vector(NULL, 4, 0): */
-		G.rule_vec = xzalloc((1 << 4) * sizeof(*G.rule_vec));
-#endif
-
 		initial_scan(temp);
 	} else {
 		process_action(temp, getpid());
